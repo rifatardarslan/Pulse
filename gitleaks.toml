@@ -1,0 +1,23 @@
+# Pulse - Gitleaks Configuration
+# Bu konfigürasyon, Gitleaks'in hangi secret patternlerini arayacağını tanımlar.
+
+title = "Pulse Gitleaks Config"
+
+[extend]
+# Gitleaks'in varsayılan kurallarını miras al (400+ kural)
+useDefault = true
+
+# Tarama dışı bırakılacak yollar (false positive'leri azaltmak için)
+[allowlist]
+  paths = [
+    '''gitleaks\.toml''',
+    '''\.gitleaksignore''',
+    '''(.*?)(jpg|gif|doc|docx|zip|xls|pdf|bin|svg|socket|png|ico)$''',
+    '''node_modules''',
+    '''vendor''',
+    '''__pycache__''',
+    '''\.git''',
+    '''\.env\.example''',
+    '''requirements\.txt''',
+    '''package-lock\.json''',
+  ]

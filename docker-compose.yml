@@ -1,0 +1,112 @@
+
+# ==========================================
+# RATIONALE (Senior Architect Note)
+# ==========================================
+# 1. Network Segmentation (Güvenlik): İki farklı network oluşturuldu. 
+#    `pulse_internal` tamamen dışa kapalıdır (internet yok); DB ve Redis burada yaşar.
+#    `pulse_external` ise dış ağa (Github, Ollama API vs.) çıkabilmesi için ayrıldı.
+# 2. DooD (Docker-out-of-Docker): Worker container'ına `/var/run/docker.sock` verildi.
+#    Ancak DooD mimarisinde, worker'ın ürettiği geçici workspace (klon) dizinini, 
+#    Host'taki Docker Daemon'ın da görebilmesi için `/tmp/pulse_workspaces` dizini 
+#    Shared Volume (Ortak Alan) olarak her iki tarafa da bağlandı. Bu kritik bir mimari hilesidir.
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: pulse_db
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-pulse}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pulse123}
+      POSTGRES_DB: ${POSTGRES_DB:-pulse}
+    volumes:
+      - pulse_pgdata:/var/lib/postgresql/data
+    networks:
+      - pulse_internal
+
+  redis:
+    image: redis:7-alpine
+    container_name: pulse_redis
+    restart: always
+    command: redis-server --save 60 1 --loglevel warning
+    volumes:
+      - pulse_redisdata:/data
+    networks:
+      - pulse_internal
+
+  app:
+    build: 
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: pulse_app
+    restart: always
+    command: python -m uvicorn app.api.main:app --host 0.0.0.0 --port 8000 --timeout-keep-alive 600
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+      - redis
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - pulse_internal
+      - pulse_external # API isteklerini alabilmesi için dışa açık
+
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: pulse_worker
+    restart: always
+    # 'scans' kuyruğunu işler — tarama pipeline görevleri burada çalışır.
+    # AI enrichment görevleri worker-ai'ya yönlendirilir, tarama asla bloke olmaz.
+    command: celery -A app.tasks.worker.celery_app worker --loglevel=info -c 4 -Q scans -n worker-scans@%h
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /tmp/pulse_workspaces:/tmp/pulse_workspaces
+    depends_on:
+      - db
+      - redis
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - pulse_internal
+      - pulse_external
+
+  worker-ai:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: pulse_worker_ai
+    restart: always
+    # 'ai' kuyruğunu işler — AI enrichment görevleri burada çalışır.
+    # Scan pipeline'ı hiçbir zaman bloke etmez.
+    command: celery -A app.tasks.worker.celery_app worker --loglevel=info -c 4 -Q ai -n worker-ai@%h
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+    depends_on:
+      - db
+      - redis
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - pulse_internal
+      - pulse_external
+
+volumes:
+  pulse_pgdata:
+  pulse_redisdata:
+
+networks:
+  pulse_internal:
+    internal: true # İnternete tamamen kapalı DMZ (Demilitarized Zone)
+  pulse_external:
