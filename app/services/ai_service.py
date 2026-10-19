@@ -79,6 +79,12 @@ async def generate_remediation(vuln_data: Dict[str, Any]) -> Dict[str, Any]:
             "confidence_score": 0.0
         }
     
+    code_context = vuln_data.get("code_context")
+    context_section = (
+        f"\n- Kod Bağlamı (±5 satır):\n```\n{code_context}\n```"
+        if code_context else ""
+    )
+
     system_prompt = (
         "Sen uzman bir siber güvenlik mühendisisin. "
         "Amacın sistemde bulunan zafiyetleri OWASP ve NIST gibi en iyi "
@@ -86,12 +92,13 @@ async def generate_remediation(vuln_data: Dict[str, Any]) -> Dict[str, Any]:
         "Lütfen çözüm önerisini Markdown formatında ve temiz bir kod bloğu içinde ver. "
         "Ayrıca adım adım çözüm talimatlarını (remediation steps) açıkla."
     )
-    
+
     user_prompt = (
         f"Aşağıdaki güvenlik zafiyeti tespit edilmiştir:\n\n"
         f"- Dosya: {file_path}\n"
         f"- Açıklama: {description}\n"
-        f"- Kanıt (Raw JSON):\n{evidence}\n\n"
+        f"- Kanıt (Raw JSON):\n{evidence}"
+        f"{context_section}\n\n"
         "Bu zafiyeti nasıl düzeltebilirim? Lütfen bana güvenli kod örneğini de ver."
     )
     

@@ -1,8 +1,9 @@
 import uuid
 import enum
 from datetime import datetime
+from typing import Any
 from sqlalchemy import String, Enum, DateTime, ForeignKey, Text, func
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.core.database import Base
 
@@ -36,6 +37,7 @@ class Scan(Base):
     
     docker_container_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     logs: Mapped[str | None] = mapped_column(Text, nullable=True)
+    scanners_run: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

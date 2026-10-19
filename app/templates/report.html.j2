@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pulse Security Report — {{ repo_url | truncate(60) }}</title>
+<style>
+  :root {
+    --bg: #0d0d0d;
+    --surface: #1a1a1a;
+    --border: #2d2d2d;
+    --accent: #bc13fe;
+    --cyan: #00d4ff;
+    --green: #00e676;
+    --yellow: #ffd600;
+    --red: #ff1744;
+    --orange: #ff6d00;
+    --text: #e0e0e0;
+    --dim: #888;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: 'Courier New', monospace; font-size: 13px; line-height: 1.6; }
+  .container { max-width: 1200px; margin: 0 auto; padding: 32px 24px; }
+
+  /* Header */
+  .header { border-bottom: 2px solid var(--accent); padding-bottom: 24px; margin-bottom: 32px; }
+  .logo { font-size: 28px; font-weight: bold; color: var(--accent); letter-spacing: 4px; margin-bottom: 8px; }
+  .subtitle { color: var(--cyan); font-size: 12px; letter-spacing: 2px; text-transform: uppercase; }
+  .meta { margin-top: 16px; display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
+  .meta-item { background: var(--surface); border: 1px solid var(--border); border-radius: 4px; padding: 12px 16px; }
+  .meta-label { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: 1px; }
+  .meta-value { color: var(--text); font-size: 13px; margin-top: 4px; word-break: break-all; }
+
+  /* Summary */
+  .summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 16px; margin-bottom: 32px; }
+  .sev-card { background: var(--surface); border-radius: 6px; padding: 16px; text-align: center; border-top: 3px solid; }
+  .sev-card.critical { border-color: var(--red); }
+  .sev-card.high { border-color: var(--orange); }
+  .sev-card.medium { border-color: var(--yellow); }
+  .sev-card.low { border-color: var(--green); }
+  .sev-card.info { border-color: var(--dim); }
+  .sev-count { font-size: 36px; font-weight: bold; }
+  .sev-card.critical .sev-count { color: var(--red); }
+  .sev-card.high .sev-count { color: var(--orange); }
+  .sev-card.medium .sev-count { color: var(--yellow); }
+  .sev-card.low .sev-count { color: var(--green); }
+  .sev-card.info .sev-count { color: var(--dim); }
+  .sev-label { color: var(--dim); font-size: 11px; text-transform: uppercase; margin-top: 4px; }
+
+  /* Section titles */
+  .section-title { color: var(--cyan); font-size: 14px; font-weight: bold; text-transform: uppercase;
+    letter-spacing: 2px; border-left: 3px solid var(--accent); padding-left: 12px;
+    margin: 32px 0 16px; }
+
+  /* Table */
+  table { width: 100%; border-collapse: collapse; margin-bottom: 32px; }
+  th { background: var(--surface); color: var(--cyan); text-align: left; padding: 10px 12px;
+    font-size: 11px; text-transform: uppercase; letter-spacing: 1px; border-bottom: 2px solid var(--border); }
+  td { padding: 9px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  tr:hover td { background: rgba(188, 19, 254, 0.04); }
+  .sev-badge { display: inline-block; padding: 2px 8px; border-radius: 3px; font-size: 11px; font-weight: bold; }
+  .sev-CRITICAL { background: rgba(255,23,68,0.15); color: var(--red); border: 1px solid var(--red); }
+  .sev-HIGH { background: rgba(255,109,0,0.15); color: var(--orange); border: 1px solid var(--orange); }
+  .sev-MEDIUM { background: rgba(255,214,0,0.15); color: var(--yellow); border: 1px solid var(--yellow); }
+  .sev-LOW { background: rgba(0,230,118,0.1); color: var(--green); border: 1px solid var(--green); }
+  .sev-INFO { background: rgba(136,136,136,0.1); color: var(--dim); border: 1px solid var(--dim); }
+  .file-path { color: var(--cyan); font-size: 12px; }
+  .fp-badge { display: inline-block; padding: 2px 6px; border-radius: 3px; font-size: 10px;
+    background: rgba(255,23,68,0.1); color: var(--red); border: 1px solid var(--red); margin-left: 6px; }
+
+  /* Remediation blocks */
+  .remediation { background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+    padding: 20px; margin-bottom: 20px; }
+  .rem-header { display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 12px; padding-bottom: 12px; border-bottom: 1px solid var(--border); }
+  .rem-title { color: var(--accent); font-weight: bold; }
+  .rem-meta { color: var(--dim); font-size: 11px; }
+  .rem-steps { color: var(--text); white-space: pre-wrap; font-size: 12px; line-height: 1.7; }
+  pre { background: #111; border: 1px solid var(--border); border-radius: 4px; padding: 16px;
+    overflow-x: auto; font-size: 12px; color: var(--cyan); margin-top: 12px; }
+
+  /* Footer */
+  .footer { border-top: 1px solid var(--border); margin-top: 48px; padding-top: 16px;
+    color: var(--dim); font-size: 11px; text-align: center; }
+  .footer a { color: var(--accent); text-decoration: none; }
+
+  /* Risk score */
+  .risk-score { background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+    padding: 16px 24px; display: inline-block; margin-bottom: 24px; }
+  .risk-label { color: var(--dim); font-size: 11px; text-transform: uppercase; }
+  .risk-value { font-size: 32px; font-weight: bold; color: {% if risk_score > 50 %}var(--red){% elif risk_score > 20 %}var(--orange){% elif risk_score > 5 %}var(--yellow){% else %}var(--green){% endif %}; }
+</style>
+</head>
+<body>
+<div class="container">
+
+  <!-- Header -->
+  <div class="header">
+    <div class="logo">PULSE</div>
+    <div class="subtitle">Security Intelligence Report · V2</div>
+    <div class="meta">
+      <div class="meta-item">
+        <div class="meta-label">Repository</div>
+        <div class="meta-value">{{ repo_url }}</div>
+      </div>
+      <div class="meta-item">
+        <div class="meta-label">Scan ID</div>
+        <div class="meta-value">{{ scan_id }}</div>
+      </div>
+      <div class="meta-item">
+        <div class="meta-label">Scan Date</div>
+        <div class="meta-value">{{ started_at }}</div>
+      </div>
+      <div class="meta-item">
+        <div class="meta-label">Duration</div>
+        <div class="meta-value">{{ duration }}</div>
+      </div>
+      <div class="meta-item">
+        <div class="meta-label">Scanners</div>
+        <div class="meta-value">{{ scanners }}</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Executive Summary -->
+  <div class="section-title">Executive Summary</div>
+
+  <div class="risk-score">
+    <div class="risk-label">Risk Score</div>
+    <div class="risk-value">{{ risk_score }}</div>
+  </div>
+
+  <div class="summary">
+    <div class="sev-card critical">
+      <div class="sev-count">{{ counts.CRITICAL }}</div>
+      <div class="sev-label">Critical</div>
+    </div>
+    <div class="sev-card high">
+      <div class="sev-count">{{ counts.HIGH }}</div>
+      <div class="sev-label">High</div>
+    </div>
+    <div class="sev-card medium">
+      <div class="sev-count">{{ counts.MEDIUM }}</div>
+      <div class="sev-label">Medium</div>
+    </div>
+    <div class="sev-card low">
+      <div class="sev-count">{{ counts.LOW }}</div>
+      <div class="sev-label">Low</div>
+    </div>
+    <div class="sev-card info">
+      <div class="sev-count">{{ counts.INFO }}</div>
+      <div class="sev-label">Info</div>
+    </div>
+  </div>
+
+  <!-- Findings Table -->
+  {% if real_vulns %}
+  <div class="section-title">Findings ({{ real_vulns | length }})</div>
+  <table>
+    <thead>
+      <tr>
+        <th>#</th>
+        <th>Type</th>
+        <th>File : Line</th>
+        <th>Severity</th>
+        <th>Description</th>
+        <th>AI</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for v in real_vulns %}
+      <tr>
+        <td>{{ loop.index }}</td>
+        <td>{{ v.vulnerability_type }}</td>
+        <td class="file-path">{{ v.file_path or 'N/A' }}{% if v.line_number %}:{{ v.line_number }}{% endif %}</td>
+        <td><span class="sev-badge sev-{{ v.severity }}">{{ v.severity }}</span></td>
+        <td>{{ v.description or '' | truncate(120) }}</td>
+        <td>{% if v.remediations %}✔{% else %}⏳{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+
+  <!-- False Positives -->
+  {% if fp_vulns %}
+  <div class="section-title">False Positives ({{ fp_vulns | length }})</div>
+  <table>
+    <thead>
+      <tr>
+        <th>#</th>
+        <th>Type</th>
+        <th>File : Line</th>
+        <th>Severity</th>
+        <th>FP Reason</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for v in fp_vulns %}
+      <tr>
+        <td>{{ loop.index }}</td>
+        <td>{{ v.vulnerability_type }} <span class="fp-badge">FP</span></td>
+        <td class="file-path">{{ v.file_path or 'N/A' }}{% if v.line_number %}:{{ v.line_number }}{% endif %}</td>
+        <td><span class="sev-badge sev-{{ v.severity }}">{{ v.severity }}</span></td>
+        <td>{{ v.false_positive_reason or 'No reason given' }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+
+  <!-- AI Remediations -->
+  {% if ai_vulns %}
+  <div class="section-title">AI Remediations ({{ ai_vulns | length }})</div>
+  {% for entry in ai_vulns %}
+  <div class="remediation">
+    <div class="rem-header">
+      <div class="rem-title">
+        <span class="sev-badge sev-{{ entry.vuln.severity }}">{{ entry.vuln.severity }}</span>
+        &nbsp; {{ entry.vuln.vulnerability_type }}
+      </div>
+      <div class="rem-meta">
+        {{ entry.vuln.file_path }}{% if entry.vuln.line_number %}:{{ entry.vuln.line_number }}{% endif %}
+        &nbsp;·&nbsp; model: {{ entry.rem.ai_model }}
+        &nbsp;·&nbsp; confidence: {{ (entry.rem.confidence_score or 0) | round(0) | int }}%
+      </div>
+    </div>
+    {% if entry.rem.remediation_steps %}
+    <div class="rem-steps">{{ entry.rem.remediation_steps }}</div>
+    {% endif %}
+    {% if entry.rem.suggested_fix %}
+    <pre>{{ entry.rem.suggested_fix }}</pre>
+    {% endif %}
+  </div>
+  {% endfor %}
+  {% endif %}
+
+  <!-- Footer -->
+  <div class="footer">
+    Generated by <a href="https://github.com/rifatardaarslan/pulse">Pulse Security v2.0.0</a>
+    &nbsp;·&nbsp; {{ generated_at }}
+  </div>
+
+</div>
+</body>
+</html>

@@ -5,33 +5,25 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
 from uuid import UUID
+from datetime import datetime, timezone
 
 from app.core.database import get_db
 from app.models.project import Project
 from app.models.scan import Scan
 from app.models.vulnerability import Vulnerability
-from app.schemas.scan import ScanRequest, ScanStatusResponse, ScanResultResponse, ScanHistoryItem
+from app.schemas.scan import (
+    ScanRequest, ScanStatusResponse, ScanResultResponse, ScanHistoryItem,
+    FalsePositiveRequest, VulnerabilityResponse,
+)
 from app.tasks.orchestration import run_scan_pipeline
 from app.tasks.worker import celery_app
+from app.api.deps import verify_api_key
 from celery.result import AsyncResult
-
-# ==========================================
-# RATIONALE (Senior Architect Note)
-# ==========================================
-# 1. Fire-and-Forget + Polling: POST /scans/ artık görevi kuyruğa atıp anında
-#    task_id döner. CLI/Frontend bu task_id ile GET /scans/status/{task_id}
-#    endpoint'ini polling ederek taramanın bitip bitmediğini öğrenir.
-# 2. Dependency Injection: Veritabanı session'ı (get_db) fonksiyona dışarıdan enjekte
-#    edilir (Depends). Böylece endpoint bitince DB bağlantısı sızıntı yapmadan kapanır.
-# 3. N+1 Query Problem Önlemi: `get_scan_results` içinde ilişkili verileri (Bulgular
-#    ve RAG AI Sonuçları) çekerken `.options(selectinload(...))` kullandım.
-# 4. Standard Hata Yönetimi: Yanlış URL formatı veya bulunamayan ID'ler için standart 
-#    HTTP 400 ve HTTP 404 JSON response'ları üretilir.
 
 router = APIRouter()
 
 @router.post("/", response_model=Dict[str, Any], status_code=status.HTTP_202_ACCEPTED)
-async def create_scan(request: ScanRequest, db: AsyncSession = Depends(get_db)):
+async def create_scan(request: ScanRequest, db: AsyncSession = Depends(get_db), _: str = Depends(verify_api_key)):
     """
     Fire-and-Forget: Taramayı kuyruğa ekler ve anında task_id ile döner.
     Taramayı beklemez — polling ile takip edilir.
@@ -77,7 +69,7 @@ async def create_scan(request: ScanRequest, db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/status/{task_id}", response_model=Dict[str, Any])
-async def get_task_status(task_id: str, db: AsyncSession = Depends(get_db)):
+async def get_task_status(task_id: str, db: AsyncSession = Depends(get_db), _: str = Depends(verify_api_key)):
     """
     Celery task durumunu polling ile sorgular.
     """
@@ -108,7 +100,7 @@ async def get_task_status(task_id: str, db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/all", response_model=List[ScanHistoryItem])
-async def list_scans(db: AsyncSession = Depends(get_db)):
+async def list_scans(db: AsyncSession = Depends(get_db), _: str = Depends(verify_api_key)):
     """
     Sistemdeki tüm taramaları (Scans) en yeniden en eskiye doğru listeler.
     """
@@ -129,7 +121,7 @@ async def list_scans(db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/project/{project_id}/latest", response_model=ScanStatusResponse)
-async def get_latest_scan_by_project(project_id: UUID, db: AsyncSession = Depends(get_db)):
+async def get_latest_scan_by_project(project_id: UUID, db: AsyncSession = Depends(get_db), _: str = Depends(verify_api_key)):
     """
     Belirli bir projenin en son taramasını döndürür. (CLI polling için gereklidir)
     """
@@ -143,7 +135,7 @@ async def get_latest_scan_by_project(project_id: UUID, db: AsyncSession = Depend
     return scan
 
 @router.get("/{scan_id}", response_model=ScanStatusResponse)
-async def get_scan_status(scan_id: UUID, db: AsyncSession = Depends(get_db)):
+async def get_scan_status(scan_id: UUID, db: AsyncSession = Depends(get_db), _: str = Depends(verify_api_key)):
     """
     Verilen Scan ID'sine ait güncel durumu döner.
     """
@@ -160,7 +152,7 @@ async def get_scan_status(scan_id: UUID, db: AsyncSession = Depends(get_db)):
     return scan
 
 @router.get("/{scan_id}/results", response_model=ScanResultResponse)
-async def get_scan_results(scan_id: UUID, db: AsyncSession = Depends(get_db)):
+async def get_scan_results(scan_id: UUID, db: AsyncSession = Depends(get_db), _: str = Depends(verify_api_key)):
     """
     Tarama tamamlandıysa, bulunan tüm zafiyetleri (Vulnerabilities) ve onlara
     ait olan AI çözüm önerilerini (Remediations) ağaç (nested) formatında getirir.
@@ -180,3 +172,52 @@ async def get_scan_results(scan_id: UUID, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Geçersiz Scan ID. Tarama bulunamadı.")
 
     return scan
+
+
+@router.patch("/{scan_id}/vulnerabilities/{vuln_id}/false-positive", response_model=VulnerabilityResponse)
+async def toggle_false_positive(
+    scan_id: UUID,
+    vuln_id: UUID,
+    request: FalsePositiveRequest,
+    db: AsyncSession = Depends(get_db),
+    _: str = Depends(verify_api_key),
+):
+    """Toggle a vulnerability's false positive status. Acts as a toggle: FP→not FP, not FP→FP."""
+    stmt = (
+        select(Vulnerability)
+        .where(Vulnerability.id == vuln_id, Vulnerability.scan_id == scan_id)
+        .options(selectinload(Vulnerability.remediations))
+    )
+    result = await db.execute(stmt)
+    vuln = result.scalar_one_or_none()
+
+    if not vuln:
+        raise HTTPException(status_code=404, detail="Vulnerability not found in this scan.")
+
+    vuln.is_false_positive = not vuln.is_false_positive
+    if vuln.is_false_positive:
+        vuln.false_positive_reason = request.reason
+        vuln.false_positive_marked_at = datetime.now(timezone.utc)
+    else:
+        vuln.false_positive_reason = None
+        vuln.false_positive_marked_at = None
+
+    await db.commit()
+    await db.refresh(vuln)
+    return vuln
+
+
+@router.get("/{scan_id}/false-positives", response_model=List[VulnerabilityResponse])
+async def list_false_positives(
+    scan_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    _: str = Depends(verify_api_key),
+):
+    """List all false positive vulnerabilities for a scan."""
+    stmt = (
+        select(Vulnerability)
+        .where(Vulnerability.scan_id == scan_id, Vulnerability.is_false_positive == True)
+        .options(selectinload(Vulnerability.remediations))
+    )
+    result = await db.execute(stmt)
+    return result.scalars().all()

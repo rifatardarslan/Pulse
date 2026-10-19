@@ -1,15 +1,3 @@
-
-# ==========================================
-# RATIONALE (Senior Architect Note)
-# ==========================================
-# 1. Network Segmentation (Güvenlik): İki farklı network oluşturuldu. 
-#    `pulse_internal` tamamen dışa kapalıdır (internet yok); DB ve Redis burada yaşar.
-#    `pulse_external` ise dış ağa (Github, Ollama API vs.) çıkabilmesi için ayrıldı.
-# 2. DooD (Docker-out-of-Docker): Worker container'ına `/var/run/docker.sock` verildi.
-#    Ancak DooD mimarisinde, worker'ın ürettiği geçici workspace (klon) dizinini, 
-#    Host'taki Docker Daemon'ın da görebilmesi için `/tmp/pulse_workspaces` dizini 
-#    Shared Volume (Ortak Alan) olarak her iki tarafa da bağlandı. Bu kritik bir mimari hilesidir.
-
 services:
   db:
     image: postgres:16-alpine
@@ -23,19 +11,29 @@ services:
       - pulse_pgdata:/var/lib/postgresql/data
     networks:
       - pulse_internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-pulse} -d ${POSTGRES_DB:-pulse}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
 
   redis:
     image: redis:7-alpine
     container_name: pulse_redis
     restart: always
-    command: redis-server --save 60 1 --loglevel warning
-    volumes:
-      - pulse_redisdata:/data
+    command: redis-server --loglevel warning
     networks:
       - pulse_internal
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
 
   app:
-    build: 
+    build:
       context: .
       dockerfile: docker/Dockerfile
     container_name: pulse_app
@@ -48,13 +46,15 @@ services:
     ports:
       - "8000:8000"
     depends_on:
-      - db
-      - redis
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:
       - pulse_internal
-      - pulse_external # API isteklerini alabilmesi için dışa açık
+      - pulse_external
 
   worker:
     build:
@@ -62,9 +62,7 @@ services:
       dockerfile: docker/Dockerfile
     container_name: pulse_worker
     restart: always
-    # 'scans' kuyruğunu işler — tarama pipeline görevleri burada çalışır.
-    # AI enrichment görevleri worker-ai'ya yönlendirilir, tarama asla bloke olmaz.
-    command: celery -A app.tasks.worker.celery_app worker --loglevel=info -c 4 -Q scans -n worker-scans@%h
+    command: celery -A app.tasks.worker.celery_app worker --loglevel=info -c 4 -Q scans -n worker-scans@%h --purge
     env_file:
       - .env
     volumes:
@@ -72,8 +70,10 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - /tmp/pulse_workspaces:/tmp/pulse_workspaces
     depends_on:
-      - db
-      - redis
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:
@@ -86,27 +86,47 @@ services:
       dockerfile: docker/Dockerfile
     container_name: pulse_worker_ai
     restart: always
-    # 'ai' kuyruğunu işler — AI enrichment görevleri burada çalışır.
-    # Scan pipeline'ı hiçbir zaman bloke etmez.
-    command: celery -A app.tasks.worker.celery_app worker --loglevel=info -c 4 -Q ai -n worker-ai@%h
+    command: celery -A app.tasks.worker.celery_app worker --loglevel=info -c 4 -Q ai -n worker-ai@%h --purge
     env_file:
       - .env
     volumes:
       - .:/app
     depends_on:
-      - db
-      - redis
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:
       - pulse_internal
       - pulse_external
 
+  beat:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: pulse_beat
+    restart: always
+    command: celery -A app.tasks.worker.celery_app beat --loglevel=info
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+      - celerybeat_data:/tmp
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - pulse_internal
+
 volumes:
   pulse_pgdata:
-  pulse_redisdata:
+  celerybeat_data:
 
 networks:
   pulse_internal:
-    internal: true # İnternete tamamen kapalı DMZ (Demilitarized Zone)
+    internal: true
   pulse_external:

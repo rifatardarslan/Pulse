@@ -1,0 +1,161 @@
+name: 'Pulse Security Scan'
+description: 'Trigger a Pulse security scan and optionally fail on critical findings.'
+author: 'Rifat Arda Arslan'
+
+inputs:
+  api_url:
+    description: 'Pulse API base URL (e.g. https://pulse.example.com)'
+    required: true
+  api_key:
+    description: 'Pulse API key (PULSE_API_KEY)'
+    required: true
+  repo_url:
+    description: 'Repository URL to scan. Defaults to the current repository.'
+    required: false
+    default: '${{ github.server_url }}/${{ github.repository }}'
+  skip_ai:
+    description: 'Skip AI remediation analysis.'
+    required: false
+    default: 'false'
+  fail_on_critical:
+    description: 'Fail the CI job when CRITICAL vulnerabilities are found (excluding false positives).'
+    required: false
+    default: 'true'
+  export_report:
+    description: 'Upload HTML report as a GitHub Actions artifact.'
+    required: false
+    default: 'true'
+  poll_timeout:
+    description: 'Maximum seconds to wait for scan completion.'
+    required: false
+    default: '600'
+
+outputs:
+  scan_id:
+    description: 'The UUID of the triggered scan.'
+    value: ${{ steps.trigger.outputs.scan_id }}
+  vuln_count:
+    description: 'Total vulnerability count (including false positives).'
+    value: ${{ steps.poll.outputs.vuln_count }}
+  critical_count:
+    description: 'Number of CRITICAL vulnerabilities (excluding false positives).'
+    value: ${{ steps.check.outputs.critical_count }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Trigger Pulse Scan
+      id: trigger
+      shell: bash
+      env:
+        PULSE_API_URL: ${{ inputs.api_url }}
+        PULSE_API_KEY: ${{ inputs.api_key }}
+        REPO_URL: ${{ inputs.repo_url }}
+        SKIP_AI: ${{ inputs.skip_ai }}
+      run: |
+        echo "Triggering Pulse scan for: $REPO_URL"
+        RESPONSE=$(curl -sf -X POST \
+          -H "X-API-Key: $PULSE_API_KEY" \
+          -H "Content-Type: application/json" \
+          -d "{\"repo_url\": \"$REPO_URL\", \"skip_ai\": $SKIP_AI}" \
+          "$PULSE_API_URL/api/v1/scans/")
+
+        if [ $? -ne 0 ]; then
+          echo "::error::Failed to trigger Pulse scan. Check PULSE_API_URL and PULSE_API_KEY."
+          exit 1
+        fi
+
+        SCAN_ID=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['scan_id'])")
+        echo "scan_id=$SCAN_ID" >> "$GITHUB_OUTPUT"
+        echo "Scan triggered: $SCAN_ID"
+
+    - name: Poll for completion
+      id: poll
+      shell: bash
+      env:
+        PULSE_API_URL: ${{ inputs.api_url }}
+        PULSE_API_KEY: ${{ inputs.api_key }}
+        SCAN_ID: ${{ steps.trigger.outputs.scan_id }}
+        POLL_TIMEOUT: ${{ inputs.poll_timeout }}
+      run: |
+        ELAPSED=0
+        INTERVAL=10
+        VULN_COUNT=0
+
+        while [ "$ELAPSED" -lt "$POLL_TIMEOUT" ]; do
+          STATUS_JSON=$(curl -sf \
+            -H "X-API-Key: $PULSE_API_KEY" \
+            "$PULSE_API_URL/api/v1/scans/$SCAN_ID")
+
+          DB_STATUS=$(echo "$STATUS_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','PENDING'))")
+          VULN_COUNT=$(echo "$STATUS_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('vuln_count',0))")
+
+          echo "[$ELAPSED s] Status: $DB_STATUS | Findings: $VULN_COUNT"
+
+          if [ "$DB_STATUS" = "COMPLETED" ] || [ "$DB_STATUS" = "FAILED" ]; then
+            break
+          fi
+
+          sleep $INTERVAL
+          ELAPSED=$((ELAPSED + INTERVAL))
+        done
+
+        if [ "$DB_STATUS" = "FAILED" ]; then
+          echo "::error::Pulse scan FAILED. Check scan logs at $PULSE_API_URL/api/v1/scans/$SCAN_ID"
+          exit 1
+        fi
+
+        echo "vuln_count=$VULN_COUNT" >> "$GITHUB_OUTPUT"
+        echo "Scan completed with $VULN_COUNT findings."
+
+    - name: Check for critical vulnerabilities
+      id: check
+      shell: bash
+      env:
+        PULSE_API_URL: ${{ inputs.api_url }}
+        PULSE_API_KEY: ${{ inputs.api_key }}
+        SCAN_ID: ${{ steps.trigger.outputs.scan_id }}
+        FAIL_ON_CRITICAL: ${{ inputs.fail_on_critical }}
+      run: |
+        RESULTS=$(curl -sf \
+          -H "X-API-Key: $PULSE_API_KEY" \
+          "$PULSE_API_URL/api/v1/scans/$SCAN_ID/results")
+
+        CRITICAL=$(echo "$RESULTS" | python3 -c "
+        import sys, json
+        d = json.load(sys.stdin)
+        print(sum(
+          1 for v in d.get('vulnerabilities', [])
+          if v.get('severity') == 'CRITICAL' and not v.get('is_false_positive', False)
+        ))
+        ")
+
+        echo "critical_count=$CRITICAL" >> "$GITHUB_OUTPUT"
+        echo "Critical vulnerabilities (excluding false positives): $CRITICAL"
+
+        if [ "$FAIL_ON_CRITICAL" = "true" ] && [ "$CRITICAL" -gt "0" ]; then
+          echo "::error::$CRITICAL CRITICAL vulnerability(ies) found. Review the Pulse report."
+          exit 1
+        fi
+
+    - name: Download HTML Report
+      if: inputs.export_report == 'true'
+      shell: bash
+      env:
+        PULSE_API_URL: ${{ inputs.api_url }}
+        PULSE_API_KEY: ${{ inputs.api_key }}
+        SCAN_ID: ${{ steps.trigger.outputs.scan_id }}
+      run: |
+        curl -sf \
+          -H "X-API-Key: $PULSE_API_KEY" \
+          "$PULSE_API_URL/api/v1/scans/$SCAN_ID/report" \
+          -o pulse-security-report.html
+        echo "Report saved to pulse-security-report.html"
+
+    - name: Upload Report Artifact
+      if: inputs.export_report == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: pulse-security-report
+        path: pulse-security-report.html
+        retention-days: 30
