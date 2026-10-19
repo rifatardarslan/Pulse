@@ -14,6 +14,7 @@ from app.core import database
 from app.models.project import Project
 from app.models.scan import Scan, ScanStatus, ScannerType
 from app.models.vulnerability import Vulnerability, Severity
+from app.models.schedule import Schedule  # noqa: F401 — ensures mapper resolves Project.schedules
 
 # ==========================================
 # RATIONALE (Senior Architect Note)
@@ -38,7 +39,8 @@ async def run_ai_analysis_task(vulnerability_id: str, vuln_data: dict):
     """
     from app.services.ai_service import generate_remediation
     from app.models.remediation import Remediation
-    
+    import app.models.schedule  # noqa: F401 — forces Schedule mapper registration before any session op
+
     async with database.AsyncSessionLocal() as session:
         try:
             ai_res = await generate_remediation(vuln_data)
@@ -68,6 +70,15 @@ def trigger_enrichment_batch(vuln_list: list):
     for v_id, v_data in vuln_list:
         process_ai_enrichment.delay(v_id, v_data)
 
+async def run_semgrep(target_dir: str) -> list:
+    """Runs Semgrep SAST and returns normalised findings."""
+    from app.scanners.semgrep import SemgrepScanner
+    import uuid as _uuid
+    scanner = SemgrepScanner(scan_id=_uuid.uuid4(), target_dir=target_dir)
+    _, raw_output = await scanner.execute()
+    return await scanner.parse_results(raw_output)
+
+
 async def run_pip_audit(target_dir: str) -> list:
     """Runs pip-audit and returns findings"""
     import json
@@ -84,12 +95,16 @@ async def run_pip_audit(target_dir: str) -> list:
         cwd=target_dir
     )
     stdout, stderr = await process.communicate()
-    
+
+    if process.returncode not in (0, 1):
+        # pip-audit exit 1 means vulnerabilities found (expected); anything else is an error
+        logger.error("pip-audit exited %s: %s", process.returncode, stderr.decode("utf-8", errors="replace")[:500])
+        return []
+
     findings = []
     if stdout:
         try:
             data = json.loads(stdout.decode('utf-8'))
-            # pip-audit returns a list of dependencies, each with a list of vulnerabilities
             for dep in data.get("dependencies", []):
                 dep_name = dep.get("name")
                 version = dep.get("version")
@@ -102,8 +117,8 @@ async def run_pip_audit(target_dir: str) -> list:
                         "description": vuln.get("description", "Dependency vulnerability")
                     })
         except Exception as e:
-            logger.error(f"Failed to parse pip-audit output: {e}")
-            
+            logger.error("Failed to parse pip-audit output: %s", e)
+
     return findings
 
 async def async_scan_logic(project_id: str, scan_id_str: str, skip_ai: bool = False) -> dict:
@@ -141,7 +156,11 @@ async def async_scan_logic(project_id: str, scan_id_str: str, skip_ai: bool = Fa
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
-            stdout, stderr = await process.communicate()
+            try:
+                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=300)
+            except asyncio.TimeoutError:
+                process.kill()
+                raise Exception("Git clone timed out after 300 seconds.")
 
             if process.returncode != 0:
                 raise Exception(f"Git clone failed (Exit {process.returncode}): {stderr.decode('utf-8')}")
@@ -189,7 +208,25 @@ async def async_scan_logic(project_id: str, scan_id_str: str, skip_ai: bool = Fa
                             session.add(vuln)
                             vulnerability_objects.append(vuln)
 
-            # 5. SCA (pip-audit)
+            # 5a. Semgrep SAST
+            semgrep_findings = await run_semgrep(target_dir)
+            for f in semgrep_findings:
+                from app.models.vulnerability import Severity as _Sev
+                sev_map = {"HIGH": _Sev.HIGH, "MEDIUM": _Sev.MEDIUM, "LOW": _Sev.LOW, "CRITICAL": _Sev.CRITICAL}
+                vuln = Vulnerability(
+                    scan_id=scan.id,
+                    tool_vulnerability_id=f["tool_vulnerability_id"],
+                    severity=sev_map.get(f["severity"], _Sev.LOW),
+                    vulnerability_type=f["vulnerability_type"],
+                    file_path=f["file_path"],
+                    line_number=f["line_number"],
+                    description=f["description"],
+                    raw_evidence=f["raw_evidence"],
+                )
+                session.add(vuln)
+                vulnerability_objects.append(vuln)
+
+            # 5b. SCA (pip-audit)
             sca_findings = await run_pip_audit(target_dir)
             for f in sca_findings:
                 vuln = Vulnerability(
@@ -214,22 +251,62 @@ async def async_scan_logic(project_id: str, scan_id_str: str, skip_ai: bool = Fa
             # için 182 kez LLM çağırmak yerine 1 kez çağırmak yeterlidir.
             enrichment_data = []
             if not skip_ai:
+                from app.services.code_context import extract_code_context
+                from app.models.remediation import Remediation as _Rem
+                from sqlalchemy import select as _sel
                 seen_rule_ids: set = set()
                 for v in vulnerability_objects:
                     if v.severity in [Severity.CRITICAL, Severity.HIGH]:
                         rule_id = v.tool_vulnerability_id or "unknown"
-                        if rule_id not in seen_rule_ids:
-                            seen_rule_ids.add(rule_id)
-                            enrichment_data.append((str(v.id), {
-                                "file_path": v.file_path,
-                                "description": v.description,
-                                "raw_evidence": v.raw_evidence
-                            }))
+                        if rule_id in seen_rule_ids:
+                            continue
+                        seen_rule_ids.add(rule_id)
+
+                        # Cross-scan reuse: if a remediation already exists for the same
+                        # vulnerability_type + tool_vulnerability_id, copy it instead of
+                        # calling the LLM again.
+                        existing_q = await session.execute(
+                            _sel(_Rem)
+                            .join(Vulnerability, _Rem.vulnerability_id == Vulnerability.id)
+                            .where(
+                                Vulnerability.tool_vulnerability_id == v.tool_vulnerability_id,
+                                Vulnerability.vulnerability_type == v.vulnerability_type,
+                                _Rem.suggested_fix.isnot(None),
+                                Vulnerability.id != v.id,
+                            )
+                            .limit(1)
+                        )
+                        existing_rem = existing_q.scalar_one_or_none()
+                        if existing_rem:
+                            session.add(_Rem(
+                                vulnerability_id=v.id,
+                                ai_model=existing_rem.ai_model,
+                                suggested_fix=existing_rem.suggested_fix,
+                                remediation_steps=existing_rem.remediation_steps,
+                                confidence_score=existing_rem.confidence_score,
+                                is_reviewed=False,
+                            ))
+                            continue
+
+                        code_ctx = extract_code_context(
+                            target_dir, v.file_path or "", v.line_number or 0
+                        )
+                        enrichment_data.append((str(v.id), {
+                            "file_path": v.file_path,
+                            "description": v.description,
+                            "raw_evidence": v.raw_evidence,
+                            "code_context": code_ctx,
+                        }))
 
             # 8. Lifecycle Kapat
             scan.status = ScanStatus.COMPLETED
             scan.finished_at = datetime.now(timezone.utc)
             scan.logs = f"Scan completed. Found {len(vulnerability_objects)} issues."
+            scan.scanners_run = {
+                "gitleaks": True,
+                "semgrep": len(semgrep_findings) >= 0,
+                "pip_audit": os.path.exists(os.path.join(target_dir, "requirements.txt")),
+            }
             project.last_scan_at = datetime.now(timezone.utc)
             
             await session.commit()
@@ -247,6 +324,24 @@ async def async_scan_logic(project_id: str, scan_id_str: str, skip_ai: bool = Fa
             # Şimdilik architect'in istediği 'Immediate Return' için orchestration.py 
             # commit sonrası result_payload hazırlıyor.
 
+            # Send webhook notification
+            from app.services.webhook_service import send_scan_webhook
+            webhook_target = getattr(project, "webhook_url", None) or os.getenv("WEBHOOK_URL", "")
+            if webhook_target:
+                duration = (scan.finished_at - scan.started_at).total_seconds() if scan.started_at else 0.0
+                crit_count = sum(1 for v in vulnerability_objects if v.severity == Severity.CRITICAL)
+                high_count_val = sum(1 for v in vulnerability_objects if v.severity == Severity.HIGH)
+                await send_scan_webhook(
+                    scan_id=str(scan.id),
+                    repo_url=project.repo_url,
+                    status="COMPLETED",
+                    vuln_count=len(vulnerability_objects),
+                    critical_count=crit_count,
+                    high_count=high_count_val,
+                    scan_duration_seconds=duration,
+                    webhook_url=webhook_target,
+                )
+
             # Trigger AI Enrichment (Completely Independent Process)
             if enrichment_data:
                 trigger_enrichment_batch.delay(enrichment_data)
@@ -255,12 +350,33 @@ async def async_scan_logic(project_id: str, scan_id_str: str, skip_ai: bool = Fa
             
         except Exception as e:
             await session.rollback()
-            if 'scan' in locals() and scan.id:
-                scan.status = ScanStatus.FAILED
-                scan.finished_at = datetime.now(timezone.utc)
-                scan.logs = f"Error: {str(e)}\n\nTraceback:\n{traceback.format_exc()}" 
-                session.add(scan)
-                await session.commit()
+            # After rollback all ORM objects are fully expired — accessing any
+            # attribute on them in an async session raises MissingGreenlet.
+            # Re-fetch fresh instances in the new implicit transaction instead.
+            try:
+                fresh_scan = await session.get(Scan, scan_uuid)
+                if fresh_scan:
+                    fresh_scan.status = ScanStatus.FAILED
+                    fresh_scan.finished_at = datetime.now(timezone.utc)
+                    fresh_scan.logs = f"Error: {str(e)}\n\nTraceback:\n{traceback.format_exc()}"
+                    await session.commit()
+                    fresh_project = await session.get(Project, project_uuid)
+                    if fresh_project:
+                        from app.services.webhook_service import send_scan_webhook
+                        webhook_target = fresh_project.webhook_url or os.getenv("WEBHOOK_URL", "")
+                        if webhook_target:
+                            await send_scan_webhook(
+                                scan_id=str(fresh_scan.id),
+                                repo_url=fresh_project.repo_url,
+                                status="FAILED",
+                                vuln_count=0,
+                                critical_count=0,
+                                high_count=0,
+                                scan_duration_seconds=0.0,
+                                webhook_url=webhook_target,
+                            )
+            except Exception:
+                pass
             return {"status": "failed", "error": str(e)}
         finally:
             shutil.rmtree(target_dir, ignore_errors=True)

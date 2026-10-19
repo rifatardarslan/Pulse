@@ -2,6 +2,10 @@
 sqlalchemy[asyncio]==2.0.29
 asyncpg==0.29.0
 
+# Database Migrations
+alembic>=1.13.0
+psycopg2-binary>=2.9.9
+
 # Task Queue
 celery==5.3.6
 redis==5.0.3
@@ -18,6 +22,12 @@ pydantic-settings==2.2.1
 # API Gateway
 fastapi>=0.115.0
 uvicorn[standard]>=0.30.0
+
+# Templating (HTML reports)
+jinja2>=3.1.4
+
+# Cron expression parsing (scheduled scans)
+croniter>=2.0.1
 
 # CLI
 typer==0.12.3

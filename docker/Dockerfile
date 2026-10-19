@@ -1,14 +1,5 @@
 FROM python:3.12-slim
 
-# ==========================================
-# RATIONALE (Senior Architect Note)
-# ==========================================
-# 1. Base Image: python:3.12-slim kullanımı gereksiz işletim sistemi paketlerinden 
-#    kaçınarak saldırı yüzeyini (attack surface) minimize eder.
-# 2. Gitleaks Binary: Tarayıcıları her ne kadar Docker SDK üzerinden (Konteyner içinde konteyner) 
-#    çalıştıracak olsak da, sistem yöneticisinin veya fallback (yedek) mekanizmalarının 
-#    direkt shell üzerinden Gitleaks koşturabilmesi için binary olarak kurulmuştur.
-
 # Gerekli işletim sistemi bağımlılıklarını kur (Git clone ve Wget için)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
@@ -27,14 +18,13 @@ RUN wget -q https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_V
 
 WORKDIR /app
 
-# Sadece requirements dosyasını kopyalayıp layer caching'den yararlan
+# Layer caching'den yararlan
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Deep Scan için Semgrep kurulumu (ayrı layer — cache dostu)
 RUN pip install --no-cache-dir semgrep
 
-# Tüm kod tabanını kopyala
 COPY . .
 
 # Import hatalarını önlemek için PYTHONPATH ayarı

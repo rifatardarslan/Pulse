@@ -2,54 +2,79 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.api.endpoints import router as scan_router
+from app.api.diff_endpoints import router as diff_router
+from app.api.report_endpoints import router as report_router
+from app.api.schedule_endpoints import router as schedule_router
 
-# ==========================================
-# RATIONALE (Senior Architect Note)
-# ==========================================
-# 1. API Gateway Configuration: FastAPI'nin ana entry point dosyasıdır.
-# 2. CORS Policies (Cross-Origin Resource Sharing): Pulse'un ileride bir React
-#    veya Vue.js tabanlı arayüzü (Dashboard) olacağı için, farklı bir port/domain 
-#    üzerinden gelen API isteklerini engellememesi adına CORS ayarları eklendi.
-# 3. Lifespan: FastAPI'nin modern yaşam döngüsü yönetimi. on_startup yerine
-#    asynccontextmanager kullanılarak DB tabloları uygulama başlarken oluşturulur.
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Uygulama başlarken DB tablolarını oluştur, kapanırken temizlik yap."""
-    from app.core.database import init_db, engine
-    
-    # Veritabanı tablolarını oluştur
-    await init_db()
-    
-    yield  # Uygulama çalışıyor
-    
-    # Shutdown: Engine bağlantılarını temizle
+    import os
+    import subprocess
+    import sys
+    import time
+    import psycopg2
+    from app.core.database import engine
+
+    db_url = os.getenv("DATABASE_URL", "").replace("postgresql+asyncpg://", "postgresql://")
+    if db_url:
+        try:
+            conn = psycopg2.connect(db_url)
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='alembic_version')"
+            )
+            has_alembic = cur.fetchone()[0]
+            cur.execute(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='projects')"
+            )
+            has_projects = cur.fetchone()[0]
+            cur.close()
+            conn.close()
+            if not has_alembic and has_projects:
+                subprocess.run(
+                    [sys.executable, "-m", "alembic", "stamp", "0001"],
+                    check=False,
+                )
+        except Exception:
+            pass
+
+    for attempt in range(1, 11):
+        result = subprocess.run(
+            [sys.executable, "-m", "alembic", "upgrade", "head"],
+            check=False,
+        )
+        if result.returncode == 0:
+            break
+        if attempt < 10:
+            time.sleep(3)
+
+    yield
+
     await engine.dispose()
+
 
 app = FastAPI(
     title="Pulse SecOps API",
     description="AI-Driven Vulnerability Analysis & Remediation Pipeline",
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
-# CORS Middleware Ayarları
 app.add_middleware(
     CORSMiddleware,
-    # TODO: Production aşamasında "allow_origins" içine sadece frontend domaini yazılmalıdır.
-    allow_origins=["*"], 
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Rotaları (Endpoints) API Gateway'e dahil et
 app.include_router(scan_router, prefix="/api/v1/scans", tags=["Scans"])
+app.include_router(diff_router, prefix="/api/v1/scans", tags=["Diff"])
+app.include_router(report_router, prefix="/api/v1/scans", tags=["Reports"])
+app.include_router(schedule_router, prefix="/api/v1/schedules", tags=["Schedules"])
+
 
 @app.get("/health", tags=["System"])
 async def health_check():
-    """
-    Kubernetes veya Docker Swarm load balancer'ları için Liveness/Readiness Probe kontrolü.
-    """
-    return {"status": "ok", "service": "Pulse API Gateway", "version": "1.0.0"}
-
+    return {"status": "ok", "service": "Pulse API Gateway", "version": "2.0.0"}

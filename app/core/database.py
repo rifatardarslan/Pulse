@@ -47,15 +47,28 @@ try:
         global engine, AsyncSessionLocal
         if engine:
             engine.sync_engine.dispose()
-        
+
         engine = create_async_engine(DATABASE_URL, echo=False, future=True, poolclass=NullPool)
         AsyncSessionLocal = async_sessionmaker(
-            bind=engine, 
-            class_=AsyncSession, 
+            bind=engine,
+            class_=AsyncSession,
             expire_on_commit=False,
             autocommit=False,
             autoflush=False,
         )
+
+        # Force all ORM mappers to configure in this worker process after fork.
+        # Without this, string-based relationship("Schedule", ...) on Project may
+        # fail to resolve if configure_mappers() runs before Schedule is imported
+        # in the forked process — even if Schedule was imported in the parent.
+        import app.models.project      # noqa: F401
+        import app.models.scan         # noqa: F401
+        import app.models.vulnerability  # noqa: F401
+        import app.models.remediation  # noqa: F401
+        import app.models.schedule     # noqa: F401
+        from sqlalchemy.orm import configure_mappers
+        configure_mappers()
+
 except ImportError:
     pass
 
